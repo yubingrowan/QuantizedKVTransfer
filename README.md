@@ -1,410 +1,301 @@
 # QuantizedKVTransfer
 
-# 基于 Ray 共享内存的量化 KV Cache 传输模块，用于 vLLM 的 Prefill-Decode 分离架构（Disaggregated Serving）。
+> **Quantized KV Cache Transfer Plugin for vLLM Disaggregated Serving**
+
+基于 **Ray Object Store** 的量化 KV Cache 传输插件，用于 **vLLM Prefill-Decode Disaggregated Serving**。
+
+---
+
+## Overview
+
+在 Prefill-Decode 分离部署中，Prefill 节点负责计算 Prompt 对应的 KV Cache，而 Decode 节点负责后续 Token 生成。
+
+由于 KV Cache 体积巨大，跨节点传输成为系统瓶颈。
+
+**QuantizedKVTransfer** 通过：
+
+- INT8 Quantization（约 50% 数据压缩）
+- Ray Object Store Shared Memory
+- Vectorized Tensor Indexing
+- Plugin-based KV Connector
+
+实现无需修改 vLLM 源码即可完成高效 KV Cache 传输。
+
+---
+
+## Features
+
+- 🚀 INT8 Quantization（约 50% 数据压缩）
+- ⚡ Ray Object Store 共享内存
+- 🔥 PyTorch 向量化批量索引
+- 📦 多请求并发
+- 🔌 基于 KVConnectorBase_V1 插件化实现
+
+---
+
+## Architecture
+
+---
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Ray Cluster                                      │
+│  ┌─────────────────────────────┐          ┌─────────────────────────────┐  │
+│  │   PrefillActor (Producer)   │          │   DecodeActor (Consumer)    │  │
+│  │                             │          │                             │  │
+│  │  ┌───────────────────────┐  │          │  ┌───────────────────────┐  │  │
+│  │  │  LLMEngine            │  │          │  │  LLMEngine            │  │  │
+│  │  │  ┌─────────────────┐  │  │          │  │  ┌─────────────────┐  │  │  │
+│  │  │  │ Attention Layer │  │  │          │  │  │ Attention Layer │  │  │  │
+│  │  │  │ (逐层)          │  │  │          │  │  │ (逐层)          │  │  │  │
+│  │  │  └────────┬────────┘  │  │          │  │  └────────┬────────┘  │  │  │
+│  │  │           │            │  │          │  │           │            │  │  │
+│  │  │  ┌────────▼────────┐  │  │          │  │  ┌────────▼────────┐  │  │  │
+│  │  │  │ 1. 提取 KV      │  │  │          │  │  │ 5. 反量化 KV    │  │  │  │
+│  │  │  │ 2. int8 量化    │  │  │          │  │  │ 6. 填充 Cache   │  │  │  │
+│  │  │  └────────┬────────┘  │  │          │  │  └────────┬────────┘  │  │  │
+│  │  └───────────┼────────────┘  │          │  └───────────┼────────────┘  │
+│  │               │               │          │               │               │
+│  │      ┌────────▼────────┐      │          │      ┌────────▼────────┐      │
+│  │      │  ray.put(k_quant)│      │          │      │  ray.get(k_ref) │      │
+│  │      └────────┬────────┘      │          │      └────────┬────────┘      │
+│  └───────────────┼────────────────┘          └───────────────┼────────────────┘
+│                  │                                            │
+│                  │  ┌────────────────────────────────────┐    │
+│                  └──►│  Ray Object Store (共享内存)     │◄───┘
+│                     │  ├─ k_ref → [int8 KV data]       │
+│                     │  ├─ v_ref → [int8 KV data]       │
+│                     │  └─ scale_ref → [scale]          │
+│                     └────────────────────────────────────┘
+│                                     ▲
+│                                     │
+│                        ┌────────────┴────────────┐
+│                        │  ProducerActor          │
+│                        │  ┌──────────────────┐   │
+│                        │  │ req_id → refs    │   │
+│                        │  │  └─ k_ref, v_ref │   │
+│                        │  │  └─ scale_ref    │   │
+│                        │  └──────────────────┘   │
+│                        └─────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────┘
+工作流程（详细调用链）
+```text
+[启动] ray.init(namespace="kv_namespace")
+   │
+   ├─ [Producer] PrefillActor.__init__()
+   │    └─ Connector.__init__() → 创建 ProducerActor (detached, namespace=kv_namespace)
+   │
+   ├─ [Consumer] DecodeActor.__init__()
+   │    └─ Connector.__init__() → 尝试获取 ProducerActor (可能失败，稍后重试)
+   │
+   ├─ [Producer] run_prefill()
+   │    ├─ add_request()
+   │    ├─ engine.step() [循环]
+   │    │    ├─ build_connector_meta() → 返回 {"request_ids": [...]}
+   │    │    ├─ start_save_kv() → 捕获 request_ids
+   │    │    ├─ 逐层 Attention:
+   │    │    │    └─ save_kv_layer()
+   │    │    │         ├─ 根据 seq_lens 切分 slot_mapping
+   │    │    │         ├─ flat_k[valid_slots] 批量提取（向量化）
+   │    │    │         ├─ int8 量化 (GPU)
+   │    │    │         └─ ray.put(k_quant) → 存共享内存（零拷贝）
+   │    │    └─ wait_for_save() → ProducerActor.add_refs(req_id, refs)
+   │    └─ abort_request()
+   │
+   └─ [Consumer] run_decode()
+        ├─ add_request()
+        ├─ engine.step() [循环，逐 token 生成]
+        │    ├─ build_connector_meta() → 返回 {"request_ids": [...]}
+        │    ├─ start_load_kv() → 获取 ProducerActor 句柄 (重试 20 次)
+        │    ├─ 逐层 Attention:
+        │    │    └─ save_kv_layer() [Consumer 侧]
+        │    │         ├─ 判断 _is_consumer → 执行加载
+        │    │         ├─ ProducerActor.get_kv_refs(req_id)
+        │    │         ├─ ray.get(refs) → 取回量化数据（零拷贝）
+        │    │         ├─ 反量化 → dequantized
+        │    │         └─ flat_k[valid_slots] = k_dequant 批量填充（向量化）
+        │    └─ 生成下一个 token (使用加载的 KV)
+        └─ 返回完整生成文本
+```
+---
 
-# 
+## Project Structure
 
-# 项目简介
+```text
+QuantizedKVTransfer/
+├── __init__.py
+├── quantized_ray_connector.py
+├── test_single_request.py
+├── test_multi_request.py
+├── eval_quantization.py
+└── README.md
+```
 
-# 在 LLM 推理场景中，Prefill 阶段和 Decode 阶段的计算负载差异巨大。通过将两阶段分离部署（Disaggregated Serving），可以独立扩缩容，大幅提升资源利用率。然而，Prefill 节点需要将计算出的 KV Cache 高效传输给 Decode 节点，这构成了新的系统瓶颈。
+---
 
-# 
+## Core Components
 
-# QuantizedKVTransfer 是一个 vLLM KV Connector 插件，通过 int8 量化将 KV Cache 压缩至 50%，并利用 Ray 共享内存实现跨进程零拷贝传输，在不修改 vLLM 源码的前提下，为 Disaggregated Serving 提供了高效的 KV 传输方案。
+### ProducerActor
 
-# 
+负责维护：
 
-# 核心特性
+- request_id → ObjectRefs 映射
+- add_refs()
+- get_kv_refs()
+- clear_refs()
 
-# int8 量化传输：将 KV Cache 从 fp16 量化为 int8，传输数据量减少 50%
+ProducerActor 不保存真实 KV 数据，仅维护 Ray ObjectRef。
 
-# 
+### QuantizedRaySharedMemoryConnector
 
-# 零拷贝共享内存：基于 Ray Object Store 实现 GPU 张量直传，避免 CPU 中转
+Producer：
 
-# 
+1. 提取 KV
+2. INT8 量化
+3. ray.put()
+4. 注册 ObjectRef
 
-# 向量化批量索引：用 PyTorch 高级索引替代 Python 循环，合并多次 CUDA 调用为一次
+Consumer：
 
-# 
+1. 查询 ObjectRef
+2. ray.get()
+3. 反量化
+4. 写入 KV Cache
 
-# 多请求并发：支持同时处理多个 Prefill/Decode 请求，按 seq\_lens 自动切分 slot\_mapping
+---
 
-# 
+## Why Quantization?
 
-# 插件式设计：继承 KVConnectorBase\_V1 接口，零侵入接入 vLLM，无需修改源码
+KV Cache 随上下文长度线性增长。
 
-# 
+INT8 量化可以：
 
-# 文件结构
+| Format | Transfer Size |
+|---------|---------------|
+| FP16 | 100% |
+| INT8 | ~50% |
 
-# text
+在保证生成质量基本一致的情况下，大幅降低网络/共享内存传输压力。
 
-# QuantizedKVTransfer/
+---
 
-# ├── \_\_init\_\_.py                      # 模块导出
+## Why Ray Object Store?
 
-# ├── quantized\_ray\_connector.py       # KV Connector 核心实现
+| Solution | Advantages | Limitations |
+|----------|------------|-------------|
+| Shared Memory | 简单 | CPU 拷贝 |
+| CUDA IPC | 高性能 | 生命周期复杂 |
+| NCCL | GPU 通信 | 更适合集体通信 |
+| **Ray Object Store** | 对象管理简单、共享内存、易集成 | 依赖 Ray |
 
-# ├── test\_single\_request.py           # 单请求测试脚本
+---
 
-# ├── test\_multi\_request.py            # 多请求测试脚本
+## Installation
 
-# ├── eval\_quantization.py             # 量化质量评估（BLEU/ROUGE）
+```bash
+pip install torch ray vllm
+```
 
-# └── README.md                        # 本文档
+---
 
-# 核心组件
+## Quick Start
 
-# 1\. ProducerActor
+### Single Request
 
-# Ray Detached Actor，负责管理 KV Cache 的 ObjectRef（取件码）
+```bash
+python test_single_request.py
+```
 
-# 
+### Multiple Requests
 
-# 不存储实际数据，仅持有轻量级引用（几十字节）
+```bash
+python test_multi_request.py
+```
 
-# 
+### Quantization Evaluation
 
-# 提供 add\_refs / get\_kv\_refs / clear\_refs 接口
+```bash
+python eval_quantization.py
+```
 
-# 
+---
 
-# 2\. QuantizedRaySharedMemoryConnector
+## Configuration
 
-# 实现 vLLM KVConnectorBase\_V1 接口
+Producer
 
-# 
+```python
+KVTransferConfig(
+    kv_connector="QuantizedRaySharedMemoryConnector",
+    kv_role="kv_producer",
+)
+```
 
-# Producer 端：提取 KV → int8 量化 → ray.put() → 注册到 Actor
+Consumer
 
-# 
+```python
+KVTransferConfig(
+    kv_connector="QuantizedRaySharedMemoryConnector",
+    kv_role="kv_consumer",
+)
+```
 
-# Consumer 端：从 Actor 获取 ObjectRef → ray.get() → 反量化 → 填充 KV Cache
+---
 
-# 
+## Evaluation
 
-# 系统架构与数据流
+| Scenario | BLEU | ROUGE-1 | ROUGE-2 | ROUGE-L |
+|----------|------|----------|----------|----------|
+| FP16 vs INT8 | 1.00 | 1.00 | 1.00 | 1.00 |
+| Corrupted Quantization | 0.45 | 0.65 | 0.54 | 0.66 |
 
-# 整体架构图
+结果表明正常量化几乎不会影响生成质量。
 
-# text
+---
 
-# ┌─────────────────────────────────────────────────────────────────────────────┐
+## Optimizations
 
-# │                           Ray Cluster                                      │
+| Optimization | Description |
+|--------------|-------------|
+| INT8 Quantization | 减少约 50% 传输数据 |
+| Ray Object Store | 共享内存对象管理 |
+| Vectorized Indexing | 减少 Python 循环 |
+| GPU Tensor Pipeline | 降低额外数据搬运 |
 
-# │  ┌─────────────────────────────┐          ┌─────────────────────────────┐  │
+---
 
-# │  │   PrefillActor (Producer)   │          │   DecodeActor (Consumer)    │  │
+## Troubleshooting
 
-# │  │                             │          │                             │  │
+| Issue | Solution |
+|-------|----------|
+| ProducerActor Not Found | 先启动 Producer |
+| CUDA OOM | 降低 GPU Memory Utilization |
+| Ray Init Failed | ray stop --force |
 
-# │  │  ┌───────────────────────┐  │          │  ┌───────────────────────┐  │  │
+---
 
-# │  │  │  LLMEngine            │  │          │  │  LLMEngine            │  │  │
+## Roadmap
 
-# │  │  │  ┌─────────────────┐  │  │          │  │  ┌─────────────────┐  │  │  │
+- [x] INT8 Quantization
+- [x] Ray Shared Memory
+- [x] Multi-request Support
+- [x] Vectorized KV Extraction
+- [ ] FP8 Quantization
+- [ ] Async KV Transfer
+- [ ] Pipeline Overlap
+- [ ] Multi-node Benchmark
 
-# │  │  │  │ Attention Layer │  │  │          │  │  │ Attention Layer │  │  │  │
+---
 
-# │  │  │  │ (逐层)          │  │  │          │  │  │ (逐层)          │  │  │  │
+## Tech Stack
 
-# │  │  │  └────────┬────────┘  │  │          │  │  └────────┬────────┘  │  │  │
+- vLLM
+- PyTorch
+- Ray
+- CUDA
+- INT8 Quantization
 
-# │  │  │           │            │  │          │  │           │            │  │  │
+---
 
-# │  │  │  ┌────────▼────────┐  │  │          │  │  ┌────────▼────────┐  │  │  │
+## License
 
-# │  │  │  │ 1. 提取 KV      │  │  │          │  │  │ 5. 反量化 KV    │  │  │  │
-
-# │  │  │  │ 2. int8 量化    │  │  │          │  │  │ 6. 填充 Cache   │  │  │  │
-
-# │  │  │  └────────┬────────┘  │  │          │  │  └────────┬────────┘  │  │  │
-
-# │  │  └───────────┼────────────┘  │          │  └───────────┼────────────┘  │
-
-# │  │               │               │          │               │               │
-
-# │  │      ┌────────▼────────┐      │          │      ┌────────▼────────┐      │
-
-# │  │      │  ray.put(k\_quant)│      │          │      │  ray.get(k\_ref) │      │
-
-# │  │      └────────┬────────┘      │          │      └────────┬────────┘      │
-
-# │  └───────────────┼────────────────┘          └───────────────┼────────────────┘
-
-# │                  │                                            │
-
-# │                  │  ┌────────────────────────────────────┐    │
-
-# │                  └──►│  Ray Object Store (共享内存)     │◄───┘
-
-# │                     │  ├─ k\_ref → \[int8 KV data]       │
-
-# │                     │  ├─ v\_ref → \[int8 KV data]       │
-
-# │                     │  └─ scale\_ref → \[scale]          │
-
-# │                     └────────────────────────────────────┘
-
-# │                                     ▲
-
-# │                                     │
-
-# │                        ┌────────────┴────────────┐
-
-# │                        │  ProducerActor          │
-
-# │                        │  ┌──────────────────┐   │
-
-# │                        │  │ req\_id → refs    │   │
-
-# │                        │  │  └─ k\_ref, v\_ref │   │
-
-# │                        │  │  └─ scale\_ref    │   │
-
-# │                        │  └──────────────────┘   │
-
-# │                        └─────────────────────────┘
-
-# └─────────────────────────────────────────────────────────────────────────────┘
-
-# 工作流程（详细调用链）
-
-# text
-
-# \[启动] ray.init(namespace="kv\_namespace")
-
-# &#x20;  │
-
-# &#x20;  ├─ \[Producer] PrefillActor.\_\_init\_\_()
-
-# &#x20;  │    └─ Connector.\_\_init\_\_() → 创建 ProducerActor (detached, namespace=kv\_namespace)
-
-# &#x20;  │
-
-# &#x20;  ├─ \[Consumer] DecodeActor.\_\_init\_\_()
-
-# &#x20;  │    └─ Connector.\_\_init\_\_() → 尝试获取 ProducerActor (可能失败，稍后重试)
-
-# &#x20;  │
-
-# &#x20;  ├─ \[Producer] run\_prefill()
-
-# &#x20;  │    ├─ add\_request()
-
-# &#x20;  │    ├─ engine.step() \[循环]
-
-# &#x20;  │    │    ├─ build\_connector\_meta() → 返回 {"request\_ids": \[...]}
-
-# &#x20;  │    │    ├─ start\_save\_kv() → 捕获 request\_ids
-
-# &#x20;  │    │    ├─ 逐层 Attention:
-
-# &#x20;  │    │    │    └─ save\_kv\_layer()
-
-# &#x20;  │    │    │         ├─ 根据 seq\_lens 切分 slot\_mapping
-
-# &#x20;  │    │    │         ├─ flat\_k\[valid\_slots] 批量提取（向量化）
-
-# &#x20;  │    │    │         ├─ int8 量化 (GPU)
-
-# &#x20;  │    │    │         └─ ray.put(k\_quant) → 存共享内存（零拷贝）
-
-# &#x20;  │    │    └─ wait\_for\_save() → ProducerActor.add\_refs(req\_id, refs)
-
-# &#x20;  │    └─ abort\_request()
-
-# &#x20;  │
-
-# &#x20;  └─ \[Consumer] run\_decode()
-
-# &#x20;       ├─ add\_request()
-
-# &#x20;       ├─ engine.step() \[循环，逐 token 生成]
-
-# &#x20;       │    ├─ build\_connector\_meta() → 返回 {"request\_ids": \[...]}
-
-# &#x20;       │    ├─ start\_load\_kv() → 获取 ProducerActor 句柄 (重试 20 次)
-
-# &#x20;       │    ├─ 逐层 Attention:
-
-# &#x20;       │    │    └─ save\_kv\_layer() \[Consumer 侧]
-
-# &#x20;       │    │         ├─ 判断 \_is\_consumer → 执行加载
-
-# &#x20;       │    │         ├─ ProducerActor.get\_kv\_refs(req\_id)
-
-# &#x20;       │    │         ├─ ray.get(refs) → 取回量化数据（零拷贝）
-
-# &#x20;       │    │         ├─ 反量化 → dequantized
-
-# &#x20;       │    │         └─ flat\_k\[valid\_slots] = k\_dequant 批量填充（向量化）
-
-# &#x20;       │    └─ 生成下一个 token (使用加载的 KV)
-
-# &#x20;       └─ 返回完整生成文本
-
-# 使用方法
-
-# 1\. 安装依赖
-
-# bash
-
-# pip install vllm ray torch
-
-# 2\. 单请求测试
-
-# bash
-
-# cd /path/to/QuantizedKVTransfer
-
-# python test\_single\_request.py
-
-# 3\. 多请求测试
-
-# bash
-
-# python test\_multi\_request.py
-
-# 4\. 量化质量评估（BLEU/ROUGE）
-
-# bash
-
-# python eval\_quantization.py
-
-# 配置参数
-
-# KVTransferConfig 配置示例
-
-# Producer 端（Prefill 节点）：
-
-# 
-
-# python
-
-# kv\_config = KVTransferConfig(
-
-# &#x20;   kv\_connector="QuantizedRaySharedMemoryConnector",
-
-# &#x20;   kv\_role="kv\_producer",
-
-# &#x20;   kv\_rank=0,
-
-# &#x20;   kv\_connector\_module\_path="quantized\_ray\_connector",
-
-# &#x20;   kv\_connector\_extra\_config={
-
-# &#x20;       "shm\_prefix": "my\_quantized\_kv",
-
-# &#x20;       "is\_producer": True,
-
-# &#x20;       "is\_consumer": False,
-
-# &#x20;   }
-
-# )
-
-# Consumer 端（Decode 节点）：
-
-# 
-
-# python
-
-# kv\_config = KVTransferConfig(
-
-# &#x20;   kv\_connector="QuantizedRaySharedMemoryConnector",
-
-# &#x20;   kv\_role="kv\_consumer",
-
-# &#x20;   kv\_rank=1,
-
-# &#x20;   kv\_connector\_module\_path="quantized\_ray\_connector",
-
-# &#x20;   kv\_connector\_extra\_config={
-
-# &#x20;       "shm\_prefix": "my\_quantized\_kv",
-
-# &#x20;       "is\_producer": False,
-
-# &#x20;       "is\_consumer": True,
-
-# &#x20;   }
-
-# )
-
-# 参数说明
-
-# 参数	类型	说明
-
-# shm\_prefix	str	Ray 共享内存前缀，Producer/Consumer 必须一致
-
-# is\_producer	bool	当前角色是否为 Prefill 节点
-
-# is\_consumer	bool	当前角色是否为 Decode 节点
-
-# 性能数据
-
-# 量化质量评估（OPT-125M）
-
-# 场景	BLEU-4	ROUGE-1	ROUGE-2	ROUGE-L
-
-# 正常量化 vs 基线	\~0.95	\~0.95	\~0.95	\~0.95
-
-# 破坏量化（除以 2）	0.45	0.65	0.54	0.66
-
-# 正常量化：生成质量与 fp16 基线几乎完全一致，验证量化无损
-
-# 
-
-# 破坏量化：仍保留约 60% 语义一致性，证明量化链路完整且鲁棒
-
-# 
-
-# 性能优化
-
-# 优化点	实现方式	效果
-
-# GPU 张量直传（零拷贝）	ray.put(k\_quant) 直接传输 GPU 张量，去掉 .cpu().numpy()	避免 GPU→CPU→共享内存 的多余拷贝，减少 PCIe 带宽占用
-
-# 向量化批量索引	flat\_k\[valid\_slots] 替代 Python for 循环逐 token 提取	将多次微小 CPU-GPU 调用合并为一次高效 CUDA 内核，消除 Python 循环开销
-
-# int8 量化	对称量化 scale = max(abs(min), abs(max)) / 127	传输数据量减少 50%，同时保持生成质量无损
-
-# 故障排查
-
-# 问题	原因	解决方案
-
-# Producer Actor 未找到	Consumer 启动时 Producer 尚未注册	Consumer 端自动重试 30 次（15 秒），如仍失败请检查启动顺序
-
-# CUDA Out of Memory	单卡上两个 Actor 显存需求超过物理显存	降低 gpu\_memory\_utilization 或使用多卡部署
-
-# Ray 初始化失败	命名空间不一致或残留进程	执行 ray stop --force 后重试
-
-# 量化结果与基线不一致	量化精度损失或数据错位	检查 slot\_mapping 切分是否正确，确认 seq\_lens 传入
-
-# 依赖项
-
-# vLLM (>= 0.19.0)
-
-# 
-
-# Ray (>= 2.9.0)
-
-# 
-
-# PyTorch (>= 2.0.0)
-
-# 
-
-# 技术栈
-
-# vLLM · PyTorch · Ray · int8 Quantization · GPU Direct · Zero-Copy · CUDA
-
-# 
-
-# 许可证
-
-# 本项目遵循 vLLM 项目的许可证。
-
+This project follows the same license as the vLLM project.
