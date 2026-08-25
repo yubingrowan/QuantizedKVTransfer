@@ -43,6 +43,12 @@ class ProducerActor:
         self._kv_refs.pop(req_id, None)
 
 class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
+    # 类变量，所有实例共享
+    _shared_producer_request_ids = []
+    _shared_current_producer_request_ids = []
+    _shared_request_blocks = {}          # req_id -> set(block_id)
+    _shared_lock = threading.Lock()      # 用于保护类变量的访问
+
     def __init__(self, vllm_config, role, kv_cache_config=None):
         super().__init__(vllm_config, role, kv_cache_config)
         self._block_size = vllm_config.cache_config.block_size
@@ -56,10 +62,15 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
         self._pending_load = {}
         self._loading_threads = {}
         self._finished_recving = set()
-        self._current_load_plan = []   # (req_id, clean_id, slot_mapping)
+        self._current_load_plan = []
         self._full_matched = {}
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # 用于实例内部的一些操作（如 pending_load）
         self._call_counts = {}
+
+        # 将实例变量指向类变量（共享）
+        self._producer_request_ids = QuantizedRaySharedMemoryConnector._shared_producer_request_ids
+        self._current_producer_request_ids = QuantizedRaySharedMemoryConnector._shared_current_producer_request_ids
+        self._request_blocks = QuantizedRaySharedMemoryConnector._shared_request_blocks  # 共享
 
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
@@ -77,6 +88,8 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
                 self._producer_actor = ray.get_actor(actor_name, namespace=KV_NAMESPACE)
             except:
                 self._producer_actor = None
+
+        print(f"[INIT] Connector obj id={id(self)}, is_producer={self._is_producer}, _current_producer_request_ids id={id(self._current_producer_request_ids)}", flush=True)
 
     def _log(self, method, msg):
         self._call_counts[method] = self._call_counts.get(method, 0) + 1
@@ -140,11 +153,11 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
         refs = ray.get(actor.get_kv_refs.remote(clean))
         if refs:
             full_matched = len(request.prompt_token_ids) - num_computed_tokens
-            self._log("get_num_new_matched_tokens", f"full_matched={full_matched}, returning ({max(0, full_matched-1)}, True)")
+            self._log("get_num_new_matched_tokens", f"full_matched={full_matched}, returning ({max(0, full_matched)}, True)")
             self._full_matched[request.request_id] = full_matched
             if full_matched <= 1:
                 return (0, False)
-            matched = full_matched - 1
+            matched = full_matched
             return (matched, True)
         self._log("get_num_new_matched_tokens", "cache miss, returning (0,False)")
         return (0, False)
@@ -152,9 +165,69 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
         self._log("update_state_after_alloc", 
                   f"req={request.request_id}, num_external_tokens={num_external_tokens}, blocks={blocks}")
-        if self._is_producer or num_external_tokens <= 0:
+        if self._is_producer:
+            req_id = request.request_id
+            # ---- 提取 block IDs ----
+            block_ids = set()
+            self._log("update_state_after_alloc", f"blocks type: {type(blocks)}, dir: {dir(blocks) if blocks else None}")
+
+            if blocks is not None:
+                if hasattr(blocks, 'blocks'):
+                    inner = blocks.blocks
+                    self._log("update_state_after_alloc", f"blocks.blocks type: {type(inner)}")
+                    if isinstance(inner, (tuple, list)):
+                        for item in inner:
+                            if isinstance(item, (tuple, list)):
+                                for b in item:
+                                    if hasattr(b, 'block_id'):
+                                        block_ids.add(b.block_id)
+                                    elif isinstance(b, int):
+                                        block_ids.add(b)
+                            elif hasattr(item, 'block_id'):
+                                block_ids.add(item.block_id)
+                            elif isinstance(item, int):
+                                block_ids.add(item)
+                elif isinstance(blocks, (tuple, list)):
+                    for item in blocks:
+                        if hasattr(item, 'block_id'):
+                            block_ids.add(item.block_id)
+                        elif isinstance(item, int):
+                            block_ids.add(item)
+                elif hasattr(blocks, 'block_id'):
+                    block_ids.add(blocks.block_id)
+                else:
+                    if isinstance(blocks, int):
+                        block_ids.add(blocks)
+                    elif isinstance(blocks, (tuple, list)):
+                        for b in blocks:
+                            if isinstance(b, int):
+                                block_ids.add(b)
+
+            self._log("update_state_after_alloc", f"extracted block_ids: {block_ids}")
+
+            if block_ids:
+                with QuantizedRaySharedMemoryConnector._shared_lock:
+                    if req_id in self._request_blocks:
+                        self._request_blocks[req_id].update(block_ids)
+                    else:
+                        self._request_blocks[req_id] = block_ids
+                self._log("update_state_after_alloc", 
+                          f"stored block_ids for {req_id}: {self._request_blocks[req_id]}")
+            else:
+                self._log("update_state_after_alloc", f"No block IDs extracted for {req_id}")
+
+            if req_id not in self._producer_request_ids:
+                self._producer_request_ids.append(req_id)
+                self._log("update_state_after_alloc", 
+                          f"ADDED {req_id} to _producer_request_ids, now: {self._producer_request_ids}")
+            else:
+                self._log("update_state_after_alloc", 
+                          f"{req_id} already in _producer_request_ids: {self._producer_request_ids}")
             return
 
+        # Consumer 逻辑（不变）
+        if num_external_tokens <= 0:
+            return
         req_id = request.request_id
         block_ids = []
         if blocks and hasattr(blocks, 'blocks'):
@@ -172,10 +245,29 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
 
     def build_connector_meta(self, scheduler_output):
         self._log("build_connector_meta", f"pending_load count: {len(self._pending_load)}")
+        self._log("build_connector_meta", 
+                  f"ENTER (self id={id(self)}): _producer_request_ids={self._producer_request_ids}, "
+                  f"_current_producer_request_ids={self._current_producer_request_ids} (id={id(self._current_producer_request_ids)})")
         meta = QuantizedConnectorMetadata()
         if self._is_producer:
+            if hasattr(scheduler_output, 'scheduled_requests') and scheduler_output.scheduled_requests:
+                request_ids = [req.request_id for req in scheduler_output.scheduled_requests]
+                QuantizedRaySharedMemoryConnector._shared_current_producer_request_ids = request_ids
+                self._log("build_connector_meta", f".................Extracted from scheduler: {request_ids}")
+            else:
+                self._log("build_connector_meta", f".................no request id")
+            if self._producer_request_ids:
+                self._current_producer_request_ids.clear()
+                self._current_producer_request_ids.extend(self._producer_request_ids)
+                self._producer_request_ids.clear()
+                self._log("build_connector_meta",
+                          f"UPDATED _current_producer_request_ids: {self._current_producer_request_ids}")
+            else:
+                self._log("build_connector_meta",
+                          f"NO new requests, _current_producer_request_ids unchanged: {self._current_producer_request_ids}")
             return meta
 
+        # Consumer 逻辑
         for req_id, (request, num_ext, block_ids) in list(self._pending_load.items()):
             if not block_ids:
                 continue
@@ -232,7 +324,6 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
                 if clean in self._loading_threads:
                     self._log("start_load_kv", f"{clean} already loading, skip")
                     continue
-                # 不再需要 load_events，直接启动线程
 
             self._log("start_load_kv", f"starting async load for {clean} (req_id={req_id})")
             thread = threading.Thread(
@@ -261,7 +352,6 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
             if no_compile_layers is None:
                 raise RuntimeError("no_compile_layers is None")
 
-            # 遍历所有层，反量化并直接写入 KV cache
             for layer_name, layer in no_compile_layers.items():
                 kv_cache = getattr(layer, "kv_cache", None)
                 if kv_cache is None:
@@ -284,13 +374,11 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
                 k_dequant = self._dequantize(k_quant, k_scale, kv_cache.dtype)
                 v_dequant = self._dequantize(v_quant, v_scale, kv_cache.dtype)
 
-                # 截取到实际需要的 token 数
                 if k_dequant.shape[0] != num_tokens:
                     self._log("_async_load", f"WARNING: layer {layer_idx} has {k_dequant.shape[0]} tokens, num_tokens={num_tokens}, trimming")
                     k_dequant = k_dequant[:num_tokens]
                     v_dequant = v_dequant[:num_tokens]
 
-                # 写入 KV cache（与原来 wait_for_layer_load 中的逻辑相同）
                 try:
                     if kv_cache.dim() == 5 and kv_cache.shape[1] == 2:
                         kv_cache[block_idxs, 0, :, offsets] = k_dequant
@@ -312,7 +400,6 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
                     self._log("_async_load", f"write failed for layer {layer_idx}: {e}")
                     raise
 
-            # 所有层写入完成后，标记请求为已就绪
             with self._lock:
                 self._finished_recving.add(original_req_id)
                 self._loading_threads.pop(clean_req_id, None)
@@ -322,17 +409,11 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
             self._log("_async_load", f"ERROR for {clean_req_id}: {e}")
             with self._lock:
                 self._loading_threads.pop(clean_req_id, None)
-                # 即使失败也加入 finished，防止死等；但调度器会尝试计算，可能导致错误
                 self._finished_recving.add(original_req_id)
 
-    # ---------- 关键修改：wait_for_layer_load 变为空 ----------
     def wait_for_layer_load(self, layer_name):
-        # 不再做任何等待或写入，因为数据已经在 _async_load 中写好了
-        # 调度器只会将已经 finished 的请求送入 forward，所以这里直接返回
         if not self._is_consumer:
             return
-        # 可选：加一个安全性检查，如果还有未完成的加载线程，可以等待（但通常不会发生）
-        # 为了演示，这里直接返回
         pass
 
     def get_finished(self, finished_req_ids):
@@ -343,9 +424,15 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
             self._log("get_finished", f"returning recving={recving}")
             for req_id in finished_req_ids:
                 clean = self._get_clean_req_id(req_id)
-                # 清理相关资源（无需再清理 _loaded_cache 等）
                 self._loading_threads.pop(clean, None)
                 self._current_load_plan = [p for p in self._current_load_plan if p[1] != clean]
+                # 清理共享的 _request_blocks
+                with QuantizedRaySharedMemoryConnector._shared_lock:
+                    self._request_blocks.pop(req_id, None)
+                    self._request_blocks.pop(clean, None)
+            if self._is_producer:
+                self._producer_request_ids.clear()
+                self._log("get_finished", f"Cleared _producer_request_ids, kept _current_producer_request_ids: {self._current_producer_request_ids}")
         return set(), recving
 
     # ---------- 保存 ----------
@@ -353,24 +440,52 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
         if not self._is_producer:
             return
 
-        request_ids = getattr(attn_metadata, "request_ids", None)
-        if not request_ids:
-            seq_lens = getattr(attn_metadata, "seq_lens", None)
-            if seq_lens is not None:
-                request_ids = [f"req_{i:03d}" for i in range(len(seq_lens))]
-            else:
-                request_ids = ["req_001"]
+        self._log("save_kv_layer", f"ENTER for layer {layer_name}")
 
-        seq_lens = getattr(attn_metadata, "seq_lens", None)
-        if seq_lens is None:
-            seq_lens = [len(getattr(attn_metadata, "slot_mapping", []))]
+        # 使用共享锁读取 _request_blocks
+        with QuantizedRaySharedMemoryConnector._shared_lock:
+            self._log("save_kv_layer", f"Current _request_blocks: {self._request_blocks}")
+
         slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         if slot_mapping is None:
+            self._log("save_kv_layer", "slot_mapping is None, returning")
             return
 
-        cum_len = [0]
-        for l in seq_lens:
-            cum_len.append(cum_len[-1] + l)
+        valid_slots = slot_mapping[slot_mapping >= 0]
+        if valid_slots.numel() == 0:
+            self._log("save_kv_layer", "No valid slots, returning")
+            return
+
+        self._log("save_kv_layer", f"valid_slots: {valid_slots.tolist()}")
+
+        # 构建 block_id -> request_id 映射（需要读取共享的 _request_blocks）
+        with QuantizedRaySharedMemoryConnector._shared_lock:
+            block_to_req = {}
+            for req_id, blk_set in self._request_blocks.items():
+                for blk in blk_set:
+                    if blk in block_to_req:
+                        self._log("save_kv_layer", f"WARNING: block {blk} already assigned to {block_to_req[blk]}, overwriting with {req_id}")
+                    block_to_req[blk] = req_id
+
+        self._log("save_kv_layer", f"block_to_req: {block_to_req}")
+
+        # 按请求分组 slot 索引
+        req_slots = {}
+        for slot_idx in valid_slots.tolist():
+            block_id = slot_idx // self._block_size
+            req_id = block_to_req.get(block_id)
+            if req_id is None:
+                self._log("save_kv_layer", f"block {block_id} not found in _request_blocks, skipping slot {slot_idx}")
+                continue
+            clean_id = self._get_clean_req_id(req_id)
+            req_slots.setdefault(clean_id, []).append(slot_idx)
+
+        self._log("save_kv_layer", f"req_slots grouped: {req_slots}")
+
+        if not req_slots:
+            self._log("save_kv_layer", "No requests found, returning")
+            return
+
         match = re.search(r'layers\.(\d+)', layer_name)
         layer_idx = int(match.group(1)) if match else 0
 
@@ -378,18 +493,15 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
         flat_k = k.permute(0, 2, 1, 3).reshape(-1, k.shape[1], k.shape[3])
         flat_v = v.permute(0, 2, 1, 3).reshape(-1, v.shape[1], v.shape[3])
 
-        for idx, req_id_full in enumerate(request_ids):
-            clean_id = self._get_clean_req_id(req_id_full)
-            start, end = cum_len[idx], cum_len[idx+1]
-            req_slots = slot_mapping[start:end]
-            valid_slots = req_slots[req_slots >= 0]
-            if valid_slots.numel() == 0:
-                continue
+        for clean_id, slot_indices in req_slots.items():
             if (clean_id, layer_idx) in self._saved_layers:
+                self._log("save_kv_layer", f"skip {clean_id} layer {layer_idx} (already saved)")
                 continue
 
-            k_stack = flat_k[valid_slots]
-            v_stack = flat_v[valid_slots]
+            slots_tensor = torch.tensor(slot_indices, dtype=torch.long, device=flat_k.device)
+            k_stack = flat_k[slots_tensor]
+            v_stack = flat_v[slots_tensor]
+
             k_quant, k_scale, _ = self._quantize(k_stack)
             v_quant, v_scale, _ = self._quantize(v_stack)
             k_ref = ray.put(k_quant)
@@ -404,7 +516,7 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
             self._kv_refs[clean_id][f"k_scale_layer{layer_idx}"] = k_scale_ref
             self._kv_refs[clean_id][f"v_scale_layer{layer_idx}"] = v_scale_ref
             self._saved_layers.add((clean_id, layer_idx))
-            self._log("save_kv_layer", f"saved layer {layer_idx} for {clean_id}, tokens={valid_slots.numel()}")
+            self._log("save_kv_layer", f"....................saved layer {layer_idx} for {clean_id}, tokens={len(slot_indices)}")
 
     def wait_for_save(self):
         if not self._is_producer or self._producer_actor is None:
@@ -431,6 +543,10 @@ class QuantizedRaySharedMemoryConnector(KVConnectorBase_V1):
             self._finished_recving.discard(request_id)
             self._full_matched.pop(request_id, None)
             self._current_load_plan = [p for p in self._current_load_plan if p[1] != clean]
+            # 清理共享的 _request_blocks
+            with QuantizedRaySharedMemoryConnector._shared_lock:
+                self._request_blocks.pop(request_id, None)
+                self._request_blocks.pop(clean, None)
         if self._is_producer and self._producer_actor is not None:
             ray.get(self._producer_actor.clear_refs.remote(clean))
     def get_connector_metadata(self, request_ids):
