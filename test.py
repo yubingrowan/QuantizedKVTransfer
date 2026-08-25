@@ -6,12 +6,12 @@ from vllm.config import KVTransferConfig
 
 KV_NAMESPACE = "kv_namespace"
 
-@ray.remote(num_gpus=0.4)
+@ray.remote(num_gpus=0.45)
 class PrefillActor:
     def __init__(self, model_path, rank=0):
         kv_config = KVTransferConfig(
             kv_connector="QuantizedRaySharedMemoryConnector",
-            kv_connector_module_path="connector_async_correct",
+            kv_connector_module_path="connector",
             kv_role="kv_producer",
             kv_rank=rank,
             kv_connector_extra_config={
@@ -22,7 +22,7 @@ class PrefillActor:
         )
         engine_args = EngineArgs(
             model=model_path,
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=0.42,
             enforce_eager=True,
             max_num_seqs=4,
             max_model_len=256,
@@ -45,7 +45,7 @@ class DecodeActor:
     def __init__(self, model_path, rank=1):
         kv_config = KVTransferConfig(
             kv_connector="QuantizedRaySharedMemoryConnector",
-            kv_connector_module_path="connector_async_correct",
+            kv_connector_module_path="connector",
             kv_role="kv_consumer",
             kv_rank=rank,
             kv_connector_extra_config={
@@ -56,7 +56,7 @@ class DecodeActor:
         )
         engine_args = EngineArgs(
             model=model_path,
-            gpu_memory_utilization=0.3,
+            gpu_memory_utilization=0.45,
             enforce_eager=True,
             max_num_seqs=4,
             max_model_len=256,
@@ -91,7 +91,9 @@ def main():
         "What should I do when",
         "The capital of France is",
         "Machine learning is a",
-        #"Python programming language can",
+        "Python programming language can",
+        "My name is",
+        "I want to find someone",
     ]
     request_ids = [f"req_{i:03d}" for i in range(len(prompts))]
 
